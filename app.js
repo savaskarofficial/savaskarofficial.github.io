@@ -4,14 +4,17 @@
   const USER = 'savaskarofficial';
   const API = 'https://api.github.com/users/' + USER + '/repos';
   const CACHE_KEY = 'savaskarofficial.repositories.v1';
+  const BACKOFF_KEY = 'savaskarofficial.repositories.retry.v1';
+  const CACHE_MAX_AGE = 10 * 60 * 1000;
   const FEATURED = ['covert', 'osinet', 'metadata_forensic'];
   const PAGE_SIZE = 100;
 
   class RepositoryError extends Error {
-    constructor(message, kind) {
+    constructor(message, kind, retryAt = 0) {
       super(message);
       this.name = 'RepositoryError';
       this.kind = kind;
+      this.retryAt = retryAt;
     }
   }
 
@@ -56,6 +59,32 @@
     return 'GitHub has reached its request limit for this connection. Please try again later.';
   }
 
+  function retryAt(response, now = Date.now()) {
+    const reset = Number(response.headers.get('x-ratelimit-reset')) * 1000;
+    const retry = response.headers.get('retry-after');
+    const after = retry ? (/^\d+$/.test(retry) ? now + Number(retry) * 1000 : Date.parse(retry)) : 0;
+    const valid = [reset, after].filter(value => Number.isFinite(value) && value > now && value <= now + 86400000);
+    return valid.length ? Math.max(...valid) + 1000 : now + 60000;
+  }
+
+  function readBackoff(storage, now = Date.now()) {
+    try {
+      const value = Number(storage.getItem(BACKOFF_KEY));
+      return Number.isFinite(value) && value > now && value <= now + 86401000 ? value : 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function saveBackoff(storage, value) {
+    try { storage.setItem(BACKOFF_KEY, String(value)); } catch (_) {}
+  }
+
+  function isFreshCache(cached, now = Date.now()) {
+    const age = now - Date.parse(cached?.savedAt);
+    return Number.isFinite(age) && age >= 0 && age < CACHE_MAX_AGE;
+  }
+
   async function fetchRepositories(options = {}) {
     const fetchImpl = options.fetchImpl || globalThis.fetch.bind(globalThis);
     const timeoutMs = options.timeoutMs || 15000;
@@ -73,8 +102,8 @@
           credentials: 'omit'
         });
         if (!response.ok) {
-          if (response.status === 429 || (response.status === 403 && response.headers.get('x-ratelimit-remaining') === '0')) {
-            throw new RepositoryError(rateLimitMessage(response), 'rate-limit');
+          if (response.status === 429 || (response.status === 403 && (response.headers.get('x-ratelimit-remaining') === '0' || response.headers.get('retry-after')))) {
+            throw new RepositoryError(rateLimitMessage(response), 'rate-limit', retryAt(response));
           }
           throw new RepositoryError('GitHub could not return the repositories (HTTP ' + response.status + '). Please try again.', 'http');
         }
@@ -107,9 +136,8 @@
     return [...repositories.values()];
   }
 
-  function readCache(storage) {
+  function normalizeSnapshot(cached) {
     try {
-      const cached = JSON.parse(storage.getItem(CACHE_KEY));
       if (cached?.version !== 1 || cached.owner !== USER || !Array.isArray(cached.repositories)) return null;
       const savedAt = validDate(cached.savedAt);
       if (!savedAt || Date.parse(savedAt) > Date.now() + 300000) return null;
@@ -131,6 +159,26 @@
       return { repositories, savedAt };
     } catch (_) {
       return null;
+    }
+  }
+
+  function readCache(storage) {
+    try { return normalizeSnapshot(JSON.parse(storage.getItem(CACHE_KEY))); } catch (_) { return null; }
+  }
+
+  async function fetchSnapshot(options = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs || 5000);
+    try {
+      const response = await (options.fetchImpl || globalThis.fetch.bind(globalThis))('repositories.json', {
+        signal: controller.signal, credentials: 'omit', cache: 'no-cache'
+      });
+      if (!response.ok) return null;
+      return normalizeSnapshot(await response.json());
+    } catch (_) {
+      return null;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -164,7 +212,8 @@
     const element = id => document.getElementById(id);
     const list = element('repos');
     if (!list) return;
-    const state = { repositories: [], available: false, filter: 'all', loading: false, savedAt: null };
+    const state = { repositories: [], available: false, filter: 'all', loading: false, savedAt: null, retryAt: readBackoff(storage) };
+    let retryTimer;
     const create = (tag, className, text) => {
       const node = document.createElement(tag);
       if (className) node.className = className;
@@ -172,7 +221,7 @@
       return node;
     };
     const dateLabel = value => new Date(value).toLocaleString([], {
-      year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short'
+      year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
     });
 
     function card(repository, featured = false) {
@@ -216,7 +265,7 @@
       list.replaceChildren(fragment);
       element('repo-count').textContent = state.available
         ? matches.length + ' of ' + state.repositories.length + ' public repositories'
-        : 'Repository count unavailable';
+        : 'Loading repositories';
       const empty = element('repo-empty');
       empty.hidden = !state.available || matches.length > 0;
       empty.textContent = state.repositories.length ? 'No repositories match these filters.' : 'No public repositories yet.';
@@ -231,18 +280,48 @@
       });
     }
 
+    function setSavedStatus(message) {
+      const status = element('sync-status');
+      status.replaceChildren(create('span', '', (state.available ? 'Saved ' + dateLabel(state.savedAt) + '. ' : '') + message + ' '));
+      const link = create('a', '', 'View on GitHub');
+      link.href = 'https://github.com/' + USER + '?tab=repositories';
+      status.append(link);
+    }
+
+    function updateRefresh() {
+      clearTimeout(retryTimer);
+      const refresh = element('refresh-repos');
+      const waiting = state.retryAt > Date.now();
+      refresh.disabled = state.loading || waiting;
+      refresh.setAttribute('aria-busy', String(state.loading));
+      refresh.title = waiting ? 'Try again after ' + new Date(state.retryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+      if (waiting && !state.loading) retryTimer = setTimeout(() => {
+        state.retryAt = 0;
+        saveBackoff(storage, 0);
+        updateRefresh();
+        setSavedStatus('You can check for updates now.');
+      }, state.retryAt - Date.now() + 50);
+    }
+
+    function showBackoff() {
+      const time = new Date(state.retryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      setSavedStatus('GitHub refresh is available after ' + time + '.');
+      element('repo-loading').hidden = true;
+      if (!state.available) element('repo-count').textContent = 'List unavailable';
+      updateRefresh();
+    }
+
     async function load() {
       if (state.loading) return;
+      if (state.retryAt > Date.now()) { showBackoff(); return; }
       state.loading = true;
-      const refresh = element('refresh-repos');
-      refresh.disabled = true;
-      refresh.setAttribute('aria-busy', 'true');
+      updateRefresh();
       element('repo-loading').hidden = state.available;
       if (!state.available) element('repo-count').textContent = 'Loading public repositories...';
       element('repo-error').hidden = true;
       const status = element('sync-status');
-      const savedMessage = state.available ? ' Showing saved data from ' + dateLabel(state.savedAt) + '.' : '';
-      status.textContent = 'Checking GitHub.' + savedMessage;
+      const savedMessage = state.available ? ' Saved ' + dateLabel(state.savedAt) + '.' : '';
+      status.textContent = 'Checking for updates.' + savedMessage;
       try {
         const repositories = await fetchRepositories({
           onPage(page) {
@@ -252,24 +331,30 @@
         state.repositories = repositories;
         state.available = true;
         state.savedAt = new Date().toISOString();
+        state.retryAt = 0;
+        saveBackoff(storage, 0);
         writeCache(storage, repositories, state.savedAt);
         render();
-        status.textContent = 'Updated from GitHub ' + dateLabel(state.savedAt) + '.';
+        status.textContent = 'Checked ' + dateLabel(state.savedAt) + '.';
       } catch (error) {
-        const errorBox = element('repo-error');
-        errorBox.replaceChildren(create('span', '', error.message + ' '));
-        const link = create('a', '', 'View repositories on GitHub');
-        link.href = 'https://github.com/' + USER + '?tab=repositories';
-        errorBox.append(link);
-        errorBox.hidden = false;
-        status.textContent = state.available
-          ? 'Showing saved repositories from ' + dateLabel(state.savedAt) + '. GitHub could not be refreshed.'
-          : 'GitHub is unavailable. Use Refresh to try again.';
         render();
+        if (error.kind === 'rate-limit') {
+          state.retryAt = error.retryAt;
+          saveBackoff(storage, state.retryAt);
+        }
+        if (state.available) {
+          if (state.retryAt > Date.now()) showBackoff();
+          else setSavedStatus("Couldn't check for updates.");
+        } else {
+          const errorBox = element('repo-error');
+          errorBox.textContent = error.message;
+          errorBox.hidden = false;
+          element('repo-count').textContent = 'List unavailable';
+          setSavedStatus('The repository list could not be loaded.');
+        }
       } finally {
         state.loading = false;
-        refresh.disabled = false;
-        refresh.setAttribute('aria-busy', 'false');
+        updateRefresh();
         element('repo-loading').hidden = true;
       }
     }
@@ -292,11 +377,32 @@
       });
     });
     element('refresh-repos').addEventListener('click', load);
-    load();
+    async function initialize() {
+      const refresh = element('refresh-repos');
+      refresh.disabled = true;
+      if (!isFreshCache(cached)) {
+        const snapshot = await fetchSnapshot();
+        if (snapshot && (!state.available || Date.parse(snapshot.savedAt) > Date.parse(state.savedAt))) {
+          state.repositories = snapshot.repositories;
+          state.savedAt = snapshot.savedAt;
+          state.available = true;
+          render();
+        }
+      }
+      if (state.retryAt > Date.now()) { showBackoff(); return; }
+      if (isFreshCache(cached)) {
+        element('repo-loading').hidden = true;
+        element('sync-status').textContent = 'Checked ' + dateLabel(state.savedAt) + '.';
+        updateRefresh();
+        return;
+      }
+      load();
+    }
+    initialize();
   }
 
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { USER, CACHE_KEY, RepositoryError, normalizeRepository, fetchRepositories, readCache, writeCache, selectRepositories };
+    module.exports = { USER, CACHE_KEY, BACKOFF_KEY, CACHE_MAX_AGE, RepositoryError, normalizeRepository, normalizeSnapshot, fetchRepositories, fetchSnapshot, readCache, writeCache, readBackoff, retryAt, isFreshCache, selectRepositories };
   }
   if (typeof window !== 'undefined' && window.document) {
     let storage;

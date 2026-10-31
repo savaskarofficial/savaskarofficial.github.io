@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { CACHE_KEY, normalizeRepository, fetchRepositories, readCache, writeCache, selectRepositories } = require('../app.js');
+const { CACHE_KEY, BACKOFF_KEY, CACHE_MAX_AGE, normalizeRepository, normalizeSnapshot, fetchRepositories, fetchSnapshot, readCache, writeCache, selectRepositories, isFreshCache, retryAt, readBackoff } = require('../app.js');
 
 function raw(id, extra = {}) {
   return {
@@ -161,4 +161,56 @@ test('deduplicates overlapping page records by repository ID', async () => {
 test('supports an account with no public repositories', async () => {
   const repositories = await fetchRepositories({ fetchImpl: async () => response([]) });
   assert.deepEqual(repositories, []);
+});
+
+test('bundled repository list is validated and cannot inject external links', async () => {
+  const savedAt = '2026-01-01T12:00:00.000Z';
+  const repository = normalizeRepository(raw(1));
+  const snapshot = { version: 1, owner: 'savaskarofficial', savedAt, repositories: [{ ...repository, url: 'https://untrusted.example/' }] };
+  assert.deepEqual(await fetchSnapshot({ fetchImpl: async () => response(snapshot) }), { savedAt, repositories: [repository] });
+  assert.equal(normalizeSnapshot({ ...snapshot, owner: 'someone-else' }), null);
+  assert.equal(normalizeSnapshot({ ...snapshot, repositories: [repository, repository] }), null);
+  assert.equal(normalizeSnapshot({ ...snapshot, savedAt: new Date(Date.now() + 86400000).toISOString() }), null);
+});
+
+test('missing, broken or unavailable snapshot does not block a later live request', async () => {
+  assert.equal(await fetchSnapshot({ fetchImpl: async () => response({}, 404) }), null);
+  assert.equal(await fetchSnapshot({ fetchImpl: async () => new Response('invalid json') }), null);
+  assert.equal(await fetchSnapshot({ fetchImpl: async () => { throw new TypeError('Network offline'); } }), null);
+  assert.equal(await fetchSnapshot({ timeoutMs: 10, fetchImpl: (url, { signal }) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(new Error('Aborted')), { once: true });
+  }) }), null);
+  assert.equal((await fetchRepositories({ fetchImpl: async () => response([raw(1)]) })).length, 1);
+});
+
+test('recent cache avoids repeated API calls but expires after ten minutes', () => {
+  const now = Date.parse('2026-01-01T12:00:00Z');
+  assert.equal(isFreshCache({ savedAt: new Date(now - 1000).toISOString() }, now), true);
+  assert.equal(isFreshCache({ savedAt: new Date(now - CACHE_MAX_AGE).toISOString() }, now), false);
+  assert.equal(isFreshCache({ savedAt: new Date(now + 1000).toISOString() }, now), false);
+  assert.equal(isFreshCache(null, now), false);
+});
+
+test('rate-limit reset and Retry-After are respected without accepting unreasonable dates', () => {
+  const now = Date.parse('2026-01-01T12:00:00Z');
+  const headers = { 'x-ratelimit-reset': String((now + 120000) / 1000), 'retry-after': '300' };
+  assert.equal(retryAt(response({}, 403, headers), now), now + 301000);
+  assert.equal(retryAt(response({}, 429, { 'retry-after': new Date(now + 120000).toUTCString() }), now), now + 121000);
+  assert.equal(retryAt(response({}, 429, { 'x-ratelimit-reset': '99999999999999' }), now), now + 60000);
+  const storage = memoryStorage();
+  storage.setItem(BACKOFF_KEY, String(now + 121000));
+  assert.equal(readBackoff(storage, now), now + 121000);
+  assert.equal(readBackoff(storage, now + 122000), 0);
+  storage.setItem(BACKOFF_KEY, String(now + 864000000));
+  assert.equal(readBackoff(storage, now), 0);
+  assert.equal(readBackoff(null, now), 0);
+});
+
+test('secondary rate limit provides a retry deadline even without primary quota headers', async () => {
+  const now = Date.now();
+  await assert.rejects(fetchRepositories({ fetchImpl: async () => response({}, 403, { 'retry-after': '120' }) }), error => {
+    assert.equal(error.kind, 'rate-limit');
+    assert.ok(error.retryAt >= now + 120000);
+    return true;
+  });
 });
